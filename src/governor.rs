@@ -3,7 +3,7 @@ use crate::config::GovernorParams;
 use crate::gpu::GPU;
 use crate::gpu_frequency_fix::GpuFrequencyFix;
 use crate::gpu_usage_fix::GpuUsageFix;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
@@ -24,6 +24,9 @@ pub struct Governor {
     performance_mode: bool,
     test_mode: bool,
     target_cycle_interval: Duration,
+    /// Last temperature actually read, reported when a read fails so the
+    /// control loop has something to log rather than a fabricated zero.
+    last_temp: u32,
 }
 
 impl Governor {
@@ -54,6 +57,7 @@ impl Governor {
             performance_mode: false,
             test_mode: false,
             target_cycle_interval,
+            last_temp: 0,
         })
     }
 
@@ -404,7 +408,21 @@ impl Governor {
     }
 
     fn update_max_freq_for_temperature(&mut self) -> Result<u32> {
-        let temp = self.gpu.read_temperature()?;
+        // A temperature that cannot be read must not stop frequency
+        // management. It gates thermal throttling and nothing else, so an
+        // unreadable sensor means "do not adjust the ceiling this cycle",
+        // not "exit". Propagating here would take the error up through
+        // run_iteration and out of main, which also skips the graceful
+        // shutdown that unforces the SMU clock and voltage.
+        let temp = match self.gpu.read_temperature() {
+            Ok(temp) => temp,
+            Err(e) => {
+                warn!("GPU temperature unavailable: {e}; leaving the frequency ceiling unchanged");
+                return Ok(self.last_temp);
+            }
+        };
+        self.last_temp = temp;
+
         if let Some(max_temp) = self.params.temperature.throttling_temp {
             let min_freq = *self.params.allowed_frequency_range.start();
             if temp > max_temp && self.max_freq > min_freq + self.params.significant_change {

@@ -210,8 +210,14 @@ fn init_temp_strategy(
     location: &BUS_INFO,
 ) -> Result<Box<dyn TempStrategy + Send>> {
     if let GpuTempRead::Sysfs = gpu_temp_read {
-        match SysfsTempStrategy::probe(&location.get_sysfs_path(), location.get_drm_render_path()?)
-        {
+        // Resolved inside the match, not as an argument: a `?` out here would
+        // abort startup for the one mode that is supposed to degrade quietly.
+        match location
+            .get_drm_render_path()
+            .map_err(AppError::from)
+            .and_then(|render_path| {
+                SysfsTempStrategy::probe(&location.get_sysfs_path(), render_path)
+            }) {
             Ok(strategy) => {
                 info!("reading GPU temperature from {}", strategy.path().display());
                 return Ok(Box::new(strategy));

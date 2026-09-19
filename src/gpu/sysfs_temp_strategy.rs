@@ -18,15 +18,29 @@ const TEMP_MAX_MILLIDEGREES: i64 = 150_000;
 /// is the expensive outcome, so the strategy then falls back to the DRM ioctl.
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
+/// Convert a validated hwmon reading to whole degrees.
+///
+/// The clamp matters because `read_hwmon_millidegrees` deliberately accepts
+/// readings down to `TEMP_MIN_MILLIDEGREES`, and `as u32` on a negative i64
+/// wraps: -1000 millidegrees would become 4294967295 rather than 0, which
+/// reads as permanently over the throttling threshold. Cyan Skillfish cannot
+/// actually report a sub-zero edge temperature -- the firmware field is a
+/// `uint16_t` in centi-Celsius -- so this is about the validator and the
+/// conversion agreeing, not about a fault seen in the field.
+fn millidegrees_to_celsius(millidegrees: i64) -> u32 {
+    (millidegrees / 1000).max(0) as u32
+}
+
 /// Reads the GPU temperature from the amdgpu hwmon `temp1_input` attribute.
 ///
-/// Holds only a path, and opens the file per read, so no DRM client is kept
-/// open for temperature. Carries the last good reading so a transient failure
-/// can be ridden out instead of ending the strategy.
+/// Opens the attribute per read, so no DRM client is held while sysfs is
+/// working. Carries the last good reading so a transient failure can be ridden
+/// out, and the render path plus a lazily built `DrmTempStrategy` so it can
+/// hand over to the ioctl if sysfs stops working altogether.
 pub(super) struct SysfsTempStrategy {
     path: PathBuf,
     drm_render_path: PathBuf,
-    drm_fallback: Option<DrmTempStrategy>,
+    fallback: Option<Box<dyn TempStrategy + Send>>,
     last_good: i64,
     failures: u32,
 }
@@ -50,7 +64,7 @@ impl SysfsTempStrategy {
         Ok(Self {
             path,
             drm_render_path,
-            drm_fallback: None,
+            fallback: None,
             last_good,
             failures: 0,
         })
@@ -61,14 +75,17 @@ impl SysfsTempStrategy {
     }
 
     /// Build a strategy straight from a known attribute path, skipping the
-    /// hwmon lookup. Tests use this to point the strategy at a scratch file.
+    /// hwmon lookup, and optionally supply the strategy it hands over to.
+    ///
+    /// Tests use this to point at a scratch file and to stand in for the DRM
+    /// ioctl, which cannot be opened in a unit test.
     #[cfg(test)]
-    fn probe_from_path(path: PathBuf) -> Self {
+    fn probe_from_path(path: PathBuf, fallback: Option<Box<dyn TempStrategy + Send>>) -> Self {
         let last_good = read_hwmon_millidegrees(&path).expect("test file must be readable");
         Self {
             path,
             drm_render_path: PathBuf::new(),
-            drm_fallback: None,
+            fallback,
             last_good,
             failures: 0,
         }
@@ -77,12 +94,12 @@ impl SysfsTempStrategy {
 
 impl TempStrategy for SysfsTempStrategy {
     /// A failed read reuses the last good value and is reported only as a
-    /// warning. An error is returned -- meaning "replace me" -- only once
-    /// `MAX_CONSECUTIVE_FAILURES` reads in a row have failed; then the strategy
-    /// switches to the DRM ioctl. A successful read resets the count, so
-    /// isolated errors never accumulate towards that.
+    /// warning. Once `MAX_CONSECUTIVE_FAILURES` reads in a row have failed the
+    /// strategy hands over to the DRM ioctl for the rest of the run. A
+    /// successful read resets the count, so isolated errors never accumulate
+    /// towards that.
     fn read_temperature(&mut self) -> Result<u32> {
-        if let Some(fallback) = &mut self.drm_fallback {
+        if let Some(fallback) = &mut self.fallback {
             return fallback.read_temperature();
         }
 
@@ -90,7 +107,7 @@ impl TempStrategy for SysfsTempStrategy {
             Ok(millidegrees) => {
                 self.last_good = millidegrees;
                 self.failures = 0;
-                Ok((millidegrees / 1000) as u32)
+                Ok(millidegrees_to_celsius(millidegrees))
             }
             Err(e) => {
                 self.failures += 1;
@@ -99,17 +116,20 @@ impl TempStrategy for SysfsTempStrategy {
                         "gpu-usage.temp-read = \"sysfs\": {e}; reusing the last good reading ({} failure(s) in a row, giving up at {MAX_CONSECUTIVE_FAILURES})",
                         self.failures
                     );
-                    return Ok((self.last_good / 1000) as u32);
+                    return Ok(millidegrees_to_celsius(self.last_good));
                 }
                 warn!(
                     "gpu-usage.temp-read = \"sysfs\": {e}; falling back to the DRM ioctl for the rest of this run"
                 );
-                let mut fallback = DrmTempStrategy {
+                let mut fallback: Box<dyn TempStrategy + Send> = Box::new(DrmTempStrategy {
                     dev_handle: init_device_handle(self.drm_render_path.clone())?,
-                };
-                let temperature = fallback.read_temperature()?;
-                self.drm_fallback = Some(fallback);
-                Ok(temperature)
+                });
+                // Kept whatever the first read through it returns: dropping it
+                // on a failed read would reopen the render node every cycle and
+                // make the warning above untrue.
+                let temperature = fallback.read_temperature();
+                self.fallback = Some(fallback);
+                temperature
             }
         }
     }
@@ -164,9 +184,24 @@ fn find_hwmon_temp_input(sysfs_path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CONSECUTIVE_FAILURES, TEMP_MAX_MILLIDEGREES, read_hwmon_millidegrees};
+    use super::{
+        MAX_CONSECUTIVE_FAILURES, TEMP_MAX_MILLIDEGREES, TEMP_MIN_MILLIDEGREES,
+        millidegrees_to_celsius, read_hwmon_millidegrees,
+    };
+    use crate::app_error::Result;
     use crate::gpu::TempStrategy;
     use std::path::PathBuf;
+
+    /// Stands in for `DrmTempStrategy`, which cannot be opened in a unit test.
+    struct StubStrategy {
+        celsius: u32,
+    }
+
+    impl TempStrategy for StubStrategy {
+        fn read_temperature(&mut self) -> Result<u32> {
+            Ok(self.celsius)
+        }
+    }
 
     /// Write `contents` to a uniquely named file and hand back its path.
     ///
@@ -222,11 +257,16 @@ mod tests {
     }
 
     /// A transient failure must not end the strategy: it reuses the last good
-    /// reading and only gives up after MAX_CONSECUTIVE_FAILURES in a row.
+    /// reading rather than propagating the error.
+    ///
+    /// Only the first `MAX_CONSECUTIVE_FAILURES - 1` failures are exercised.
+    /// The hand-over itself opens a real DRM render node, which a unit test
+    /// cannot do; `reads_delegate_to_the_fallback_once_one_is_installed`
+    /// covers what happens afterwards.
     #[test]
     fn a_transient_failure_reuses_the_last_good_reading() {
         let path = temp_file_with("45000\n");
-        let mut strategy = super::SysfsTempStrategy::probe_from_path(path.clone());
+        let mut strategy = super::SysfsTempStrategy::probe_from_path(path.clone(), None);
 
         assert_eq!(strategy.read_temperature().unwrap(), 45);
 
@@ -238,12 +278,53 @@ mod tests {
                 "a failed read should reuse the last good value"
             );
         }
-        assert!(
-            strategy.read_temperature().is_err(),
-            "the {MAX_CONSECUTIVE_FAILURES}th consecutive failure should give up"
-        );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Once a fallback is installed, reads go through it and the attribute is
+    /// not consulted again -- the state after a hand-over.
+    #[test]
+    fn reads_delegate_to_the_fallback_once_one_is_installed() {
+        let path = temp_file_with("45000\n");
+        let mut strategy = super::SysfsTempStrategy::probe_from_path(
+            path.clone(),
+            Some(Box::new(StubStrategy { celsius: 61 })),
+        );
+
+        // Remove the attribute: if anything still read it, this would fail.
+        std::fs::remove_file(&path).unwrap();
+
+        for _ in 0..(MAX_CONSECUTIVE_FAILURES * 2) {
+            assert_eq!(strategy.read_temperature().unwrap(), 61);
+        }
+    }
+
+    /// The conversion must clamp. `read_hwmon_millidegrees` accepts readings
+    /// down to TEMP_MIN_MILLIDEGREES, and a bare `as u32` on a negative i64
+    /// wraps to roughly u32::MAX, which reads as permanently over the
+    /// throttling threshold.
+    #[test]
+    fn a_sub_zero_reading_clamps_instead_of_wrapping() {
+        assert_eq!(millidegrees_to_celsius(TEMP_MIN_MILLIDEGREES), 0);
+        assert_eq!(millidegrees_to_celsius(-1000), 0);
+        assert_eq!(millidegrees_to_celsius(-1), 0);
+        assert_eq!(millidegrees_to_celsius(0), 0);
+        assert_eq!(millidegrees_to_celsius(45_000), 45);
+        assert_eq!(millidegrees_to_celsius(TEMP_MAX_MILLIDEGREES), 150);
+    }
+
+    /// The validator and the conversion must agree on what is acceptable: a
+    /// reading the validator lets through must survive the conversion.
+    #[test]
+    fn every_accepted_reading_converts_to_a_sane_temperature() {
+        for millidegrees in [TEMP_MIN_MILLIDEGREES, -1, 0, 45_000, TEMP_MAX_MILLIDEGREES] {
+            let celsius = millidegrees_to_celsius(millidegrees);
+            assert!(
+                celsius <= 150,
+                "{millidegrees} millidegrees converted to {celsius} C"
+            );
+        }
     }
 
     /// A good read in between must reset the count, so isolated errors never
@@ -251,7 +332,7 @@ mod tests {
     #[test]
     fn a_good_read_resets_the_failure_count() {
         let path = temp_file_with("45000\n");
-        let mut strategy = super::SysfsTempStrategy::probe_from_path(path.clone());
+        let mut strategy = super::SysfsTempStrategy::probe_from_path(path.clone(), None);
 
         for _ in 0..(MAX_CONSECUTIVE_FAILURES * 3) {
             std::fs::write(&path, "garbage\n").unwrap();
